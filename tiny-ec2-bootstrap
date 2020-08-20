@@ -3,7 +3,8 @@
 
 description="Provides EC2 cloud bootstrap"
 
-# override in /etc/conf.d/tiny-ec2-bootstrap
+# overridable via /etc/conf.d/tiny-ec2-bootstrap
+EC2_IPV6=${EC2_IPV6:-false}
 EC2_USER=${EC2_USER:-alpine}
 IMDS2_TOKEN_TTL=${IMDS2_TOKEN_TTL:-5}
 
@@ -66,8 +67,13 @@ _run_userdata() {
 		ec=$(cat "$ec_file")
 
 		echo "User Data Script Exit Status: $ec"
-		return $ec
+		return "$ec"
 	fi
+}
+
+_add_ipv6() {
+	/sbin/ec2-ipv6 eth0 install
+	/sbin/ec2-ipv6 eth0 add
 }
 
 _resize_root_partition() {
@@ -89,6 +95,9 @@ start() {
 	ebegin "Resizing root partition"; _resize_root_partition; eend $?
 	ebegin "Setting ec2 hostname"; _update_hostname; eend $?
 	ebegin "Setting ec2 user ssh keys"; _set_ssh_keys "$EC2_USER"; eend $?
+	if [ "$EC2_IPV6" = "true" ]; then
+		ebegin "Configuring eth0 EC2 IPv6 addresses"; _add_ipv6; eend $?
+	fi
 	ebegin "Running ec2 user data script"; _run_userdata; eend $?
 
 	touch "/var/lib/cloud/.bootstrap-complete"

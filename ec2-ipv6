@@ -1,0 +1,132 @@
+#!/usr/bin/env sh
+# vim:set ft=sh noet ts=4:
+
+set -e
+
+SCRIPT="$(basename "$0")"
+
+usage() {
+	cat <<- EOT
+		Usage: $SCRIPT { help | <interface> <action> }
+		<action> :-
+		  list       - list EC2 IPv6 addresses associated with interface
+		  add        - add EC2 IPv6 addresses to interface
+		  del        - remove EC2 IPv6 addresses from interface
+		  install    - config /etc/network/interfaces to auto-add EC2 IPv6
+		  uninstall  - remove /etc/network/interfaces auto-add config
+	EOT
+	if [ "$1" = "help" ]; then
+		exit 0
+	fi
+	exit 1
+}
+
+if [ "$#" -ne 2 ]; then
+	usage "$@"
+fi
+
+IFACE="$1"
+ACTION="$2"
+shift 2
+
+IMDS2="X-aws-ec2-metadata-token"
+CONFIG="/etc/network/interfaces"
+
+log() {
+	LEV="$1"
+	shift
+	logger -s -p "kern.$LEV" -t "$SCRIPT" "$@"
+}
+
+meta_token() {
+	echo -ne "PUT /latest/api/token HTTP/1.0\r\n$IMDS2-ttl-seconds: 5\r\n\r\n" |
+		nc 169.254.169.254 80 | tail -n 1
+}
+
+meta() {
+	wget -qO - --header "$IMDS2: $(meta_token)" \
+		"http://169.254.169.254/latest/meta-data/$1" 2>/dev/null
+}
+
+iface_mac() {
+	ip -f link addr show "$IFACE" |
+		sed -E -e '/link\/ether/!d' -e 's/.*ether ([0-9a-f:]+).*/\1/'
+}
+
+iface_ipv6s() {
+	MAC="$(iface_mac)"
+	if [ -z "$MAC" ]; then
+		log err "Unknown link/ether '$IFACE'"
+		exit 1
+	fi
+	meta "network/interfaces/macs/$(iface_mac)/ipv6s"
+}
+
+cfg_has_iface() {
+	grep -Fq "iface $IFACE inet " "$CONFIG"
+}
+
+cfg_has_ec2ipv6() {
+	grep -Fq "ec2-ipv6 $IFACE " "$CONFIG"
+}
+
+iface_has_ipv6() {
+	ip -f inet6 addr show "$IFACE" |
+		grep -Fq "inet6 $1/64 "
+}
+
+EXIT=
+case "$ACTION" in
+	add|del|list)
+		for ip6 in $(iface_ipv6s); do
+			if [ "$ACTION" = "list" ]; then
+				echo "$ip6"
+			else
+				MSG="$IFACE $ACTION $ip6"
+				if iface_has_ipv6 "$ip6"; then
+					if [ "$ACTION" = "add" ]; then
+						log info "$MSG - already exists"
+						continue
+					fi
+				else
+					if [ "$ACTION" = "del" ]; then
+						log info "$MSG - already gone"
+						continue
+					fi
+				fi
+				if ip -f inet6 addr "$ACTION" "$ip6/64" dev "$IFACE" 2>/dev/null; then
+					log notice "$MSG - successful"
+				else
+					log err "$MSG - FAILED"
+					EXIT=1
+				fi
+			fi
+		done
+		;;
+	install|uninstall)
+		if cfg_has_iface; then
+			if [ "$ACTION" = "install" ]; then
+				if cfg_has_ec2ipv6; then
+					log info "already installed for $IFACE in $CONFIG"
+					exit 0
+				else
+					SED_ADD="\\\tpost-up /sbin/ec2-ipv6 $IFACE add"
+					SED_DEL="\tpre-down /sbin/ec2-ipv6 $IFACE del"
+					SED_EXPR="/iface $IFACE inet /a $SED_ADD\n$SED_DEL"
+				fi
+			else
+				SED_EXPR="/ec2-ipv6 $IFACE /d"
+			fi
+			sed -i "$SED_EXPR" "$CONFIG"
+			log notice "${ACTION}ed for $IFACE in $CONFIG"
+		else
+			log error "'iface $IFACE inet' not defined in $CONFIG"
+			exit 1
+		fi
+		;;
+	*)
+		log error "Invalid '$ACTION' action" >&2
+		usage
+		;;
+esac
+exit $EXIT
